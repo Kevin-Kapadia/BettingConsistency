@@ -1,0 +1,1203 @@
+---
+title: "Stable Preferences and Sports Betting Choices: Analysis Code"
+subtitle: "Reproduces every value, table, and model reported in the manuscript, in the order they appear"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    code-fold: true
+    code-summary: "Show code"
+embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+# Paths are relative to the folder that contains this file. Fitted models are saved to modelPath
+# and reloaded on later renders, so the slow fits run only once.
+modelPath <- "Models/BetLevel/"
+dir.create(modelPath, showWarnings = FALSE, recursive = TRUE)
+options(tibble.width = Inf, scipen = 99, mc.cores = parallel::detectCores())
+
+library(tidyverse)
+library(kableExtra)
+library(brms)
+library(posterior)
+
+map <- purrr::map
+filter <- dplyr::filter
+select <- dplyr::select
+
+# Sampler settings
+n_chains <- 4
+n_iter <- 4000
+n_iter_cv <- n_iter / 2
+n_draws_pred <- 2000
+cv_seed <- 2026
+
+# Models fitted at the same time (each uses n_chains cores and about 3 to 4 GB of RAM). Parallel fitting needs Mac or Linux.
+ram_gb <- tryCatch({
+  if (Sys.info()[["sysname"]] == "Darwin") as.numeric(system("sysctl -n hw.memsize", intern = TRUE)) / 1e9
+  else as.numeric(gsub("[^0-9]", "", readLines("/proc/meminfo", n = 1))) / 1e6
+}, error = function(e) NA_real_)
+
+n_parallel <- if (.Platform$OS.type == "windows" || is.na(ram_gb)) 1 else min(3, max(1, floor((ram_gb - 4) / 4)))
+```
+
+# About This File {.unnumbered}
+
+This file reproduces the analyses reported in the manuscript from `Strategies1_shareable.csv`. The sections follow the order of the manuscript (Method, Results, Appendix A, Appendix B), and each table caption uses the manuscript's table number. Participants are identified only by an anonymous ID (P001 to P299).
+
+The first render fits 11 models, 44 cross-validation fits, and the joint model in the exploratory analysis, which takes several hours on a laptop. Every fit is saved to `Models/BetLevel/`, so later renders take minutes. The internal label for the College Football Playoff slate is "CFB"; printed labels use "CFP", as in the manuscript.
+
+# Data Preparation {.unnumbered}
+
+```{r import}
+strat <- read.csv("Strategies1_shareable.csv") %>%
+  filter(Finished == TRUE) %>%
+  # The participant ID column is named PROLIFIC_PID inside the code so that the formulas match the saved models.
+  # In the shareable data it holds the anonymous ID.
+  rename(PROLIFIC_PID = ParticipantID)
+
+# Optional, for the authors only: a private key that maps the anonymous IDs back to the IDs used when the models
+# were first fitted, so that the saved model files are reused instead of refit. Without the key, the models are fit
+# from scratch with the anonymous IDs and give the same results up to Monte Carlo error.
+key_file <- "Strategies1_id_key_private.csv"
+if (file.exists(key_file)) {
+  id_key <- read.csv(key_file)
+  strat <- strat %>% mutate(PROLIFIC_PID = id_key$PROLIFIC_PID[match(PROLIFIC_PID, id_key$ParticipantID)])
+  stopifnot(!anyNA(strat$PROLIFIC_PID))
+}
+```
+
+```{r helpers}
+is_selected <- function(x) !is.na(x) & x != "" & x != "Not place a bet"
+
+implied_prob_from_american <- function(odds) ifelse(odds < 0, -odds / (-odds + 100), 100 / (odds + 100))
+
+fmt2 <- function(x) formatC(round(x, 2), format = "f", digits = 2)
+
+fmt3 <- function(x) formatC(round(x, 3), format = "f", digits = 3)
+
+# Printed label for the college slate: the data use "CFB" internally, the manuscript uses "CFP"
+cfp <- function(x) str_replace_all(x, "CFB", "CFP")
+```
+
+```{r scoring}
+strat <- strat %>%
+  mutate(across(starts_with("DOSPERT_") & !ends_with("_num"), ~ case_when(
+    str_detect(as.character(.x), regex("Extremely unlikely", ignore_case = TRUE)) ~ 1,
+    str_detect(as.character(.x), regex("Moderately unlikely", ignore_case = TRUE)) ~ 2,
+    str_detect(as.character(.x), regex("Slightly unlikely", ignore_case = TRUE))   ~ 3,
+    str_detect(as.character(.x), regex("Neither", ignore_case = TRUE))             ~ 4,
+    str_detect(as.character(.x), regex("Slightly likely", ignore_case = TRUE))     ~ 5,
+    str_detect(as.character(.x), regex("Moderately likely", ignore_case = TRUE))   ~ 6,
+    str_detect(as.character(.x), regex("Extremely likely", ignore_case = TRUE))    ~ 7,
+    TRUE ~ NA_real_), .names = "{.col}_num")) %>%
+  mutate(DOSPERTMean = rowMeans(
+    select(., starts_with("DOSPERT_") & ends_with("_num")), na.rm = TRUE))
+
+strat <- strat %>%
+  mutate(across(starts_with("BIS_") & !ends_with("_num"), ~ case_when(
+    str_detect(as.character(.x), regex("Rarely|Never", ignore_case = TRUE))        ~ 1,
+    str_detect(as.character(.x), regex("Occasionally", ignore_case = TRUE))        ~ 2,
+    str_detect(as.character(.x), regex("Often", ignore_case = TRUE))               ~ 3,
+    str_detect(as.character(.x), regex("Almost always|Always", ignore_case = TRUE)) ~ 4,
+    TRUE ~ NA_real_), .names = "{.col}_num")) %>%
+  mutate(BISMean = rowMeans(
+    select(., starts_with("BIS_") & ends_with("_num")), na.rm = TRUE))
+
+strat <- strat %>%
+  mutate(CRT1_bin = if_else(CRT1 %in% c(5, 0.05), 1, 0),
+         CRT2_bin = if_else(CRT2 == 5, 1, 0),
+         CRT3_bin = if_else(CRT3 == 47, 1, 0))
+
+strat <- strat %>%
+  mutate(CRTsum = CRT1_bin + CRT2_bin + CRT3_bin)
+
+strat <- strat %>%
+  mutate(BNT1_bin = if_else(BNT1 == 30, 1, 0),
+         BNT2_bin = if_else(BNT2 == 0.25, 1, 0),
+         BNT3_bin = if_else(BNT3 == 20, 1, 0),
+         BNT4_bin = if_else(BNT4 == 0.5, 1, 0))
+
+strat <- strat %>%
+  mutate(BNTsum = BNT1_bin + BNT2_bin + BNT3_bin + BNT4_bin)
+
+strat <- strat %>%
+  mutate(across(starts_with("SportsWatching_") & !ends_with("_num"), ~ case_when(
+    str_detect(.x, regex("Do not follow", ignore_case = TRUE))       ~ 0,
+    str_detect(.x, regex("Casually aware", ignore_case = TRUE))      ~ 1,
+    str_detect(.x, regex("Moderately follow", ignore_case = TRUE))   ~ 2,
+    str_detect(.x, regex("Very closely follow", ignore_case = TRUE)) ~ 4,
+    str_detect(.x, regex("Closely follow", ignore_case = TRUE))      ~ 3,
+    TRUE ~ NA_real_), .names = "{.col}_num")) %>%
+  mutate(
+    SportsEngagementSum  = rowSums(
+      select(., starts_with("SportsWatching_") & ends_with("_num")), na.rm = TRUE),
+    SportsEngagementProp = rowMeans(
+      select(., starts_with("SportsWatching_") & ends_with("_num")) >= 1, na.rm = TRUE))
+
+strat <- strat %>%
+  mutate(PeerApproveNum = case_when(
+    str_detect(as.character(PeerApprove), regex("Strongly disagree", ignore_case = TRUE)) ~ 1,
+    str_detect(as.character(PeerApprove), regex("^Disagree$", ignore_case = TRUE))        ~ 2,
+    str_detect(as.character(PeerApprove), regex("Somewhat disagree", ignore_case = TRUE)) ~ 3,
+    str_detect(as.character(PeerApprove), regex("Neither", ignore_case = TRUE))           ~ 4,
+    str_detect(as.character(PeerApprove), regex("Somewhat agree", ignore_case = TRUE))    ~ 5,
+    str_detect(as.character(PeerApprove), regex("^Agree$", ignore_case = TRUE))           ~ 6,
+    str_detect(as.character(PeerApprove), regex("Strongly agree", ignore_case = TRUE))    ~ 7,
+    TRUE ~ NA_real_))
+
+strat <- strat %>%
+  mutate(
+    RaceBinary = if_else(Race.Ethnicity == "White (Non-Hispanic)", 1, 0),
+    FinancialNum = case_when(
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("cannot meet basic needs", ignore_case = TRUE))            ~ 1,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("struggle to meet basic needs", ignore_case = TRUE))       ~ 2,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("just meet basic needs", ignore_case = TRUE))              ~ 3,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("little left over", ignore_case = TRUE))                   ~ 4,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("somewhat financially comfortable", ignore_case = TRUE))   ~ 5,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("^I am financially comfortable$", ignore_case = TRUE))     ~ 6,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("financially well[- ]*off", ignore_case = TRUE))           ~ 7,
+      TRUE ~ NA_real_),
+    EducationBinary = if_else(Education %in% c(
+      "Bachelor's or 4 year degree (ex. BA, BS)",
+      "Masters degree (ex. MA, MS, MBA)",
+      "Doctorate or Professional degree (eg. PhD, MD, JD, DDS, EdD)"),
+      "Bachelor's or Higher", "Less than Bachelor's"))
+
+participant_measures <- strat %>%
+  filter(Gender %in% c("Male", "Female")) %>%
+  select(PROLIFIC_PID, DOSPERTMean, BISMean, CRTsum, BNTsum, SportsEngagementProp,
+    Recency, Frequency, Typical.Bet, YearBegin, NumPlatforms, PeerApproveNum, PeerPercent_1,
+    Age, Gender, Race.Ethnicity, RaceBinary, Education, EducationBinary, Financial.Wellbeing., FinancialNum)
+```
+
+```{r menu}
+scen_map <- tribble(~Scenario, ~ShownPrefix, ~HiddenPrefix, ~ShownBlock, ~HiddenBlock,
+  "CFB", "CFP_Bets_Prob_", "CFP_Bets_Hidden_", 1, 5,
+  "NFL Moneyline", "ML_Prob_Bets_", "ML_Hidden_Bets_", 2, 8,
+  "NFL Spread", "Spread_Prob_Bets_", "Spread_Hidden_Bets_", 3, 7,
+  "NFL Totals", "Totals_Prob_Bets_", "Totals_Hidden_Bets_", 4, 6)
+
+scenario_levels <- scen_map$Scenario
+
+market_levels <- c("CFB Moneyline", "CFB Spread", "CFB Totals", "NFL Moneyline", "NFL Spread", "NFL Totals")
+
+first_label <- function(col) { v <- strat[[col]]; v <- v[!is.na(v) & v != ""]; v[1] }
+
+team_of <- function(lbl) str_squish(str_remove(lbl, "\\s*(Spread|Moneyline|[+-]\\d+(\\.\\d+)?)?\\s*\\(.*$"))
+
+# One row per scenario x option (option k = 2..13; k = 1 is "Not place a bet", k = 14 is "Parlay")
+menu <- scen_map %>%
+  select(Scenario, ShownPrefix) %>%
+  crossing(k = 2:13) %>%
+  mutate(Label = map2_chr(ShownPrefix, k, ~ first_label(paste0(.x, .y))),
+    Odds = as.numeric(str_extract(Label, "(?<=\\()[+-]?\\d+(?=\\))")),
+    ImpliedProb = implied_prob_from_american(Odds),
+    BetType = case_when(Scenario == "NFL Moneyline" ~ "Moneyline", Scenario == "NFL Spread" ~ "Spread",
+      Scenario == "NFL Totals" ~ "Totals", str_detect(Label, "Spread") ~ "Spread",
+      str_detect(Label, "Over|Under") ~ "Totals", TRUE ~ "Moneyline"),
+    League = if_else(Scenario == "CFB", "CFB", "NFL"),
+    MarketType = factor(paste(League, BetType), market_levels),
+    Market = (k - 2) %/% 2 + 1,
+    Side = (k - 2) %% 2 + 1,
+    Game = if_else(Scenario == "CFB", if_else(k <= 7, 1L, 2L), as.integer(Market)),
+    Team = if_else(BetType == "Totals", NA_character_, team_of(Label)),
+    SpreadLine = as.numeric(str_extract(Label, "(?<=\\s)[+-]\\d+(\\.\\d+)?(?=\\s\\()"))) %>%
+  group_by(Scenario, Market) %>%
+  mutate(q = ImpliedProb / sum(ImpliedProb)) %>%
+  ungroup()
+
+cfb_favorites <- menu %>%
+  filter(Scenario == "CFB", BetType == "Moneyline") %>%
+  group_by(Game) %>%
+  slice_max(q, n = 1) %>%
+  ungroup() %>%
+  select(Game, CFBFavorite = Team)
+
+menu <- menu %>%
+  left_join(cfb_favorites, by = "Game") %>%
+  mutate(IsFavorite = case_when(BetType == "Totals" ~ NA, BetType == "Moneyline" ~ q > .5,
+      Scenario == "CFB" ~ Team == CFBFavorite, TRUE ~ SpreadLine < 0),
+    Favorite = case_when(is.na(IsFavorite) ~ 0, IsFavorite ~ .5, TRUE ~ -.5),
+    Over = case_when(BetType != "Totals" ~ 0, str_detect(Label, "Over") ~ .5, TRUE ~ -.5),
+    WinProb10 = (q - .5) * 10,
+    Spread = as.numeric(BetType == "Spread"),
+    Totals = as.numeric(BetType == "Totals"),
+    OptionID = paste(Scenario, k),
+    Scenario = factor(Scenario, scenario_levels)) %>%
+  select(-ShownPrefix, -CFBFavorite)
+```
+
+```{r blocks}
+parse_kv <- function(x) {
+  if (is.na(x) || trimws(x) == "") return(NULL)
+  parts <- str_split(str_replace_all(x, "\\|+", "|"), "\\|")[[1]]
+  kv <- str_split_fixed(parts[parts != ""], "=", 2)
+  setNames(as.list(kv[, 2]), kv[, 1])
+}
+
+kv_num <- function(l, key) { v <- l[[key]]; if (is.null(v) || v == "") NA_real_ else as.numeric(v) }
+
+blocks <- map_dfr(seq_len(nrow(scen_map)), function(i) {
+  sm <- scen_map[i, ]
+  map_dfr(seq_len(nrow(strat)), function(r) {
+    shown <- parse_kv(strat[[paste0("Block", sm$ShownBlock, "_Stakes")]][r])
+    hidden <- parse_kv(strat[[paste0("Block", sm$HiddenBlock, "_Stakes")]][r])
+    cond <- if (!is.null(shown)) "Shown" else if (!is.null(hidden)) "Hidden" else NA_character_
+    kv <- if (!is.null(shown)) shown else hidden
+    prefix <- if (identical(cond, "Shown")) sm$ShownPrefix else sm$HiddenPrefix
+    sel <- which(vapply(2:13, function(k) is_selected(strat[[paste0(prefix, k)]][r]), logical(1))) + 1
+    stakes <- vapply(sel, function(k) { s <- kv_num(kv, paste0("Stake_", k)); ifelse(is.na(s), 0, s) }, numeric(1))
+    is_parlay <- isTRUE(kv_num(kv, "IsParlay") == 1) && length(sel) >= 2
+    tibble(PROLIFIC_PID = strat$PROLIFIC_PID[r], Scenario = sm$Scenario, InformationCondition = cond,
+      Options = list(sel), Parlay = as.integer(is_parlay),
+      TotalStake = if (is_parlay) kv_num(kv, "ParlayStake") else sum(stakes))
+  })
+}) %>%
+  mutate(Scenario = factor(Scenario, scenario_levels), NumBets = lengths(Options))
+```
+
+```{r covariates}
+cov_names <- c("Age", "Gender", "RaceBinary", "EducationBinary", "FinancialNum", "DOSPERTMean", "BISMean", "CRTsum", "BNTsum",
+  "SportsEngagementProp", "Frequency", "Typical.Bet", "Recency", "NumPlatforms", "PeerApproveNum", "PeerPercent_1", "YearBegin")
+
+cov_labels <- setNames(c("Age", "Gender (male)", "Race (White non-Hispanic)", "Education (bachelor's+)", "Financial wellbeing",
+  "DOSPERT", "ABIS", "CRT", "BNT", "Sports engagement", "Betting frequency (log)", "Typical bet amount (log)",
+  "Days since last bet (log)", "Number of platforms (log)", "Peer approval", "Peer betting %", "Year began betting"), cov_names)
+
+persons_raw <- participant_measures %>%
+  mutate(Gender = as.integer(Gender == "Male"), EducationBinary = as.integer(EducationBinary == "Bachelor's or Higher")) %>%
+  select(PROLIFIC_PID, all_of(cov_names)) %>%
+  drop_na() %>%
+  inner_join(blocks %>% distinct(PROLIFIC_PID, InformationCondition) %>% drop_na(), by = "PROLIFIC_PID")
+
+persons <- persons_raw %>%
+  mutate(across(c(Frequency, Typical.Bet, Recency, NumPlatforms), log1p)) %>%
+  mutate(across(all_of(cov_names), ~ as.numeric(scale(.x)))) %>%
+  mutate(Shown = if_else(InformationCondition == "Shown", .5, -.5))
+```
+
+```{r datasets}
+blocks <- blocks %>%
+  filter(PROLIFIC_PID %in% persons$PROLIFIC_PID) %>%
+  mutate(Block = paste(PROLIFIC_PID, Scenario, sep = "_"))
+
+set.seed(cv_seed)
+
+fold_key <- blocks %>%
+  distinct(PROLIFIC_PID) %>%
+  mutate(perm = map(PROLIFIC_PID, ~ sample(1:4))) %>%
+  unnest(perm) %>%
+  group_by(PROLIFIC_PID) %>%
+  mutate(Scenario = factor(scenario_levels, scenario_levels)) %>%
+  ungroup() %>%
+  rename(Fold = perm)
+
+blocks <- blocks %>% left_join(fold_key, by = c("PROLIFIC_PID", "Scenario"))
+
+bets <- blocks %>%
+  select(PROLIFIC_PID, Scenario, Block, Fold, Options, Parlay) %>%
+  inner_join(menu %>% select(Scenario, k, Market, OptionID, Label, MarketType, BetType, Team, q, WinProb10, Favorite, Over, Spread, Totals),
+    by = "Scenario", relationship = "many-to-many") %>%
+  mutate(Took = as.integer(map2_lgl(k, Options, ~ .x %in% .y)), AsParlayLeg = Took * Parlay) %>%
+  select(-Options) %>%
+  left_join(persons %>% select(PROLIFIC_PID, Shown, all_of(cov_names)), by = "PROLIFIC_PID")
+
+contrasts(bets$MarketType) <- contr.sum(6)
+
+n_both_sides <- bets %>% filter(Took == 1) %>% count(Block, Market) %>% filter(n > 1) %>% nrow()
+
+parlay_d <- blocks %>%
+  filter(NumBets >= 2) %>%
+  mutate(LegWinProb = map2_dbl(Scenario, Options, ~ mean(menu$q[menu$Scenario == .x & menu$k %in% .y])),
+    LegWinProb10 = (LegWinProb - .5) * 10,
+    Legs = NumBets - 2) %>%
+  select(-Options) %>%
+  left_join(persons %>% select(PROLIFIC_PID, Shown, all_of(cov_names)), by = "PROLIFIC_PID")
+
+contrasts(parlay_d$Scenario) <- contr.sum(4)
+```
+
+```{r tools}
+priors_for <- function(f) {
+  p <- prior(normal(0, 1), class = b)
+  if (str_detect(f, "\\|")) p <- p + prior(exponential(1), class = sd)
+  if (str_detect(f, "\\(1 \\+ [^|]+\\| PROLIFIC_PID\\)")) p <- p + prior(lkj(2), class = cor)
+  p
+}
+
+fit_model <- function(f, data, name, iter = n_iter) {
+  invisible(gc())
+  brm(bf(as.formula(f)), data = data, family = bernoulli(), prior = priors_for(f), chains = n_chains, iter = iter,
+    seed = 1, refresh = 0, init = 0, file = paste0(modelPath, name), file_refit = "on_change")
+}
+
+# Refit a full-data model on each fold's training data and predict that fold's held-out rows.
+# update() reuses the compiled model, so the folds do not recompile. Fold fits are saved to modelPath;
+# delete them (files ending in _foldN.rds) if the data change.
+fit_fold <- function(full, train, name) {
+  path <- paste0(modelPath, name, ".rds")
+  if (file.exists(path)) return(readRDS(path))
+  invisible(gc())
+  fit <- update(full, newdata = train, recompile = FALSE, chains = n_chains, iter = n_iter_cv, seed = 1, refresh = 0, init = 0)
+  saveRDS(fit, path)
+  fit
+}
+
+cv_predict <- function(full, data, name, outcome) {
+  map_dfr(1:4, function(fold) {
+    train <- filter(data, Fold != fold)
+    test <- filter(data, Fold == fold)
+    fit <- fit_fold(full, train, paste0(name, "_fold", fold))
+    set.seed(cv_seed + fold)  # new-level draws and draw subsampling are random; this makes them reproducible
+    p <- colMeans(posterior_epred(fit, newdata = test, allow_new_levels = TRUE, sample_new_levels = "gaussian", ndraws = min(n_draws_pred, ndraws(fit))))
+    tibble(row = test$row, Block = test$Block, y = test[[outcome]], p = p, p0 = mean(train[[outcome]]))
+  })
+}
+
+auc <- function(y, p) {
+  r <- rank(p); n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+loglik <- function(y, p) { p <- pmin(pmax(p, 1e-9), 1 - 1e-9); y * log(p) + (1 - y) * log(1 - p) }
+
+cv_metrics <- function(cv) {
+  cv %>%
+    group_by(Model) %>%
+    summarise(`CV pseudo-R²` = 1 - sum(loglik(y, p)) / sum(loglik(y, p0)), AUC = auc(y, p), .groups = "drop")
+}
+
+# Paired ELPD difference (model b minus model a), summed over held-out slips
+elpd_diff <- function(cv, a, b) {
+  d <- cv %>%
+    filter(Model %in% c(a, b)) %>%
+    group_by(Model, Block) %>%
+    summarise(ll = sum(loglik(y, p)), .groups = "drop") %>%
+    pivot_wider(names_from = Model, values_from = ll)
+  dd <- d[[b]] - d[[a]]
+  c(d = sum(dd), se = sqrt(length(dd)) * sd(dd))
+}
+
+# ELPD of every model relative to the best one (0 for the best), as reported by loo_compare()
+elpd_vs_best <- function(cv) {
+  tot <- cv %>% group_by(Model) %>% summarise(elpd = sum(loglik(y, p)), .groups = "drop")
+  best <- tot$Model[which.max(tot$elpd)]
+  tot %>%
+    mutate(v = map(Model, ~ if (.x == best) c(d = 0, se = 0) else elpd_diff(cv, best, .x)),
+      d_best = map_dbl(v, "d"), se_best = map_dbl(v, "se"), Best = Model == best) %>%
+    select(-v)
+}
+
+or_ci <- function(fit, pars) {
+  fe <- fixef(fit)
+  fe <- fe[intersect(pars, rownames(fe)), , drop = FALSE]
+  tibble(term = rownames(fe), est = fe[, "Estimate"], lo = fe[, "Q2.5"], hi = fe[, "Q97.5"]) %>%
+    mutate(`OR [95% CrI]` = paste0(fmt2(exp(est)), " [", fmt2(exp(lo)), ", ", fmt2(exp(hi)), "]"), credible = lo > 0 | hi < 0)
+}
+
+# Share of between-person variance explained by covariates: 1 - tau²(with) / tau²(without), over posterior draws
+r2_between <- function(fit0, fit1, par) {
+  t0 <- as_draws_df(fit0)[[par]]; t1 <- as_draws_df(fit1)[[par]]
+  n <- min(length(t0), length(t1))
+  r <- 1 - (t1[seq_len(n)] / t0[seq_len(n)])^2
+  c(med = median(r), lo = unname(quantile(r, .025)), hi = unname(quantile(r, .975)))
+}
+
+pct_ci <- function(v) paste0(round(100 * v["med"]), "% [", if_else(v["lo"] < -1, "below -100", as.character(round(100 * v["lo"]))), "%, ", round(100 * v["hi"]), "%]")
+
+# Plain-language verdict for a paired comparison: reliable if |ΔELPD| > 2 SE
+verdict <- function(cmp, which) {
+  r <- cmp %>% filter(str_detect(Comparison, fixed(which)))
+  v <- if (r$d > 2 * r$se) "gives a reliable improvement" else if (r$d < -2 * r$se) "makes prediction reliably worse" else "makes no reliable difference"
+  paste0(v, " (ΔELPD = ", formatC(r$d, format = "f", digits = 1), ", *SE* = ", formatC(r$se, format = "f", digits = 1), ")")
+}
+
+fmt_elpd <- function(v) paste0(formatC(v["d"], format = "f", digits = 1), " (SE = ", formatC(v["se"], format = "f", digits = 1), ")")
+
+n_iter_cv <- n_iter / 2
+
+# Text helpers: APA numbers without a leading zero, and ready-made strings for the results text
+nz <- function(x) sub("^(-?)0\\.", "\\1.", x)
+
+r2z <- function(x) nz(fmt3(x))
+
+d_txt <- function(cmp, which) {
+  r <- cmp %>% filter(str_detect(Comparison, fixed(which)))
+  paste0("ΔELPD = ", formatC(r$d, format = "f", digits = 1), ", *SE* = ", formatC(r$se, format = "f", digits = 1))
+}
+
+or_txt <- function(fit, par) {
+  fe <- fixef(fit)[par, ]
+  paste0("OR = ", fmt2(exp(fe["Estimate"])), ", 95% CrI [", fmt2(exp(fe["Q2.5"])), ", ", fmt2(exp(fe["Q97.5"])), "]")
+}
+
+sd_txt <- function(fit, group, par) {
+  s <- VarCorr(fit)[[group]]$sd[par, ]
+  paste0("SD = ", fmt2(s["Estimate"]), ", 95% CrI [", fmt2(s["Q2.5"]), ", ", fmt2(s["Q97.5"]), "]")
+}
+
+r2_med <- function(v) paste0(round(100 * v["med"]), "%")
+
+r2_ci <- function(v) paste0("[", if (v["lo"] < -1) "< -100" else round(100 * v["lo"]), "%, ", round(100 * v["hi"]), "%]")
+
+# Run n jobs in parallel (n_parallel at a time). A forked job can be killed when memory runs out, so any job
+# that fails is rerun once on its own, in this process. If it still fails, stop and report its error message.
+par_run <- function(n, f) {
+  failed <- function(r) is.null(r) || inherits(r, c("error", "try-error"))
+  res <- parallel::mclapply(seq_len(n), function(i) tryCatch(f(i), error = function(e) e), mc.cores = n_parallel)
+  for (i in which(map_lgl(res, failed))) res[[i]] <- tryCatch(f(i), error = function(e) e)
+  bad <- which(map_lgl(res, failed))
+  if (length(bad) > 0) {
+    msgs <- map_chr(res[bad], ~ if (inherits(.x, "error")) conditionMessage(.x) else "no result")
+    stop("Job(s) ", paste(bad, collapse = ", "), " failed: ", paste(msgs, collapse = " | "), call. = FALSE)
+  }
+  res
+}
+
+slip_labels <- c(Legs = "Each additional leg", LegWinProb10 = "Average leg win probability (+10 points)", Shown = "Probabilities shown")
+
+term_label <- function(x) {
+  map_chr(str_split(x, ":"), function(parts) {
+    lab <- c(cov_labels, WinProb10 = "win probability", Favorite = "favorite", Over = "over", Totals = "totals")[parts]
+    paste(lab[order(parts %in% cov_names, decreasing = TRUE)], collapse = " × ")
+  })
+}
+
+fixed_label <- function(x) {
+  lab <- c(Intercept = "Intercept", menu_labels, slip_labels[c("Legs", "LegWinProb10")], cov_labels)
+  map_chr(x, function(t) {
+    if (str_detect(t, "^MarketType\\d+$")) return(cfp(paste0("Market type: ", levels(bets$MarketType)[as.integer(str_extract(t, "\\d+"))])))
+    if (str_detect(t, "^Scenario\\d+$")) return(cfp(paste0("Slate: ", scenario_levels[as.integer(str_extract(t, "\\d+"))])))
+    if (t %in% names(lab)) return(unname(lab[t]))
+    if (str_detect(t, ":")) return(term_label(t))
+    t
+  })
+}
+
+re_rows <- function(fit) {
+  vc <- tryCatch(VarCorr(fit), error = function(e) NULL)
+  if (is.null(vc)) return(tibble(Term = character(), est = numeric(), se = numeric(), lo = numeric(), hi = numeric()))
+  grp_lab <- c(PROLIFIC_PID = "Participant", Block = "Slip (participant × slate)", OptionID = "Bet")
+  par_lab <- c(Intercept = "intercept", WinProb10 = "win probability", Favorite = "favorite", Over = "over", Totals = "totals")
+  rows <- list()
+  for (g in intersect(names(grp_lab), names(vc))) {
+    sdm <- vc[[g]]$sd
+    for (p in rownames(sdm)) {
+      rows[[length(rows) + 1]] <- tibble(Term = paste0("SD: ", grp_lab[g], ", ", par_lab[p]), est = sdm[p, "Estimate"], se = sdm[p, "Est.Error"], lo = sdm[p, "Q2.5"], hi = sdm[p, "Q97.5"])
+    }
+    if (!is.null(vc[[g]]$cor)) {
+      cm <- vc[[g]]$cor
+      ps <- dimnames(cm)[[1]]
+      for (i in 2:length(ps)) for (j in 1:(i - 1)) {
+        v <- cm[ps[i], , ps[j]]
+        rows[[length(rows) + 1]] <- tibble(Term = paste0("r: ", par_lab[ps[j]], ", ", par_lab[ps[i]]), est = v["Estimate"], se = v["Est.Error"], lo = v["Q2.5"], hi = v["Q97.5"])
+      }
+    }
+  }
+  bind_rows(rows)
+}
+
+coef_table <- function(fit, caption) {
+  fe <- fixef(fit)
+  fixed <- tibble(Term = fixed_label(rownames(fe)), b = fmt2(fe[, "Estimate"]), SE = fmt2(fe[, "Est.Error"]),
+    `95% CrI` = paste0("[", fmt2(fe[, "Q2.5"]), ", ", fmt2(fe[, "Q97.5"]), "]"), OR = fmt2(exp(fe[, "Estimate"])))
+  re <- re_rows(fit)
+  random <- tibble(Term = re$Term, b = fmt2(re$est), SE = fmt2(re$se), `95% CrI` = paste0("[", fmt2(re$lo), ", ", fmt2(re$hi), "]"), OR = "")
+  kable(bind_rows(fixed, random), caption = caption) %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE, font_size = 12) %>%
+    pack_rows("Fixed effects", 1, nrow(fixed)) %>%
+    {if (nrow(random) > 0) pack_rows(., "Random effects", nrow(fixed) + 1, nrow(fixed) + nrow(random)) else .} %>%
+    footnote(general = coef_note(fit))
+}
+
+# Table note that mentions only the terms the model contains
+coef_note <- function(fit) {
+  terms <- rownames(fixef(fit))
+  has <- function(p) any(str_detect(terms, p))
+  vc <- tryCatch(VarCorr(fit), error = function(e) NULL)
+  has_cor <- !is.null(vc) && any(map_lgl(vc, ~ !is.null(.x$cor)))
+  paste(c("b = posterior mean on the log-odds scale; SE = posterior standard deviation; CrI = 95% equal-tailed credible interval; OR = exp(b).",
+    if (has("^MarketType")) "Market type is sum-coded, so each estimate is a deviation from the average across market types (the last, NFL Totals, is omitted).",
+    if (has("^Scenario")) "Slate is sum-coded, so each estimate is a deviation from the average across slates (the last, NFL Totals, is omitted).",
+    if (has("^WinProb10|:WinProb10")) "Win probability is per 10 percentage points.",
+    if (has("^LegWinProb10")) "Average leg win probability is per 10 percentage points; legs are centered at two.",
+    if (has("^Favorite|^Over")) "Favorite and over are coded ±0.5.",
+    if (has("^Shown")) "Probabilities shown is coded +0.5 (shown) and -0.5 (hidden).",
+    if (any(terms %in% cov_names)) "Covariates are standardized; ABIS is scored so that higher values indicate more planning.",
+    if (!is.null(vc)) paste0("Random effects are standard deviations (SD)", if (has_cor) " and correlations (r)" else "", " on the log-odds scale.")), collapse = " ")
+}
+
+m_sd <- function(x, d = 2) paste0(formatC(mean(x, na.rm = TRUE), format = "f", digits = d), " (", formatC(sd(x, na.rm = TRUE), format = "f", digits = d), ")")
+
+n_pct <- function(x) paste0(sum(x == 1, na.rm = TRUE), " (", round(100 * mean(x == 1, na.rm = TRUE)), "%)")
+
+rng <- function(x, d = 2) paste0(formatC(min(x, na.rm = TRUE), format = "f", digits = d), ", ", formatC(max(x, na.rm = TRUE), format = "f", digits = d))
+
+pct <- function(x) paste0(formatC(100 * x, format = "f", digits = 1), "%")
+
+# Lower-triangle correlation table; * = Holm-adjusted p < .05, across all correlations in the table (by = "all") or within each column (by = "col")
+cor_table <- function(dat, row_vars, col_vars = row_vars, row_labels = row_vars, col_labels = col_vars, method = "pearson", by = "all") {
+  grid <- expand_grid(r = row_vars, c = col_vars)
+  if (identical(row_vars, col_vars)) grid <- grid %>% filter(match(c, col_vars) < match(r, row_vars))
+  grid <- grid %>%
+    mutate(test = map2(r, c, ~ suppressWarnings(cor.test(dat[[.x]], dat[[.y]], method = method, exact = FALSE))),
+      est = map_dbl(test, "estimate"), p = map_dbl(test, "p.value")) %>%
+    group_by(grp = if (by == "col") c else "all") %>%
+    mutate(p_holm = p.adjust(p, "holm")) %>%
+    ungroup() %>%
+    mutate(
+      cell = paste0(sub("^(-?)0\\.", "\\1.", formatC(est, format = "f", digits = 2)), if_else(p_holm < .05, "*", "")))
+  out <- matrix("", length(row_vars), length(col_vars), dimnames = list(row_labels, col_labels))
+  for (i in seq_len(nrow(grid))) out[match(grid$r[i], row_vars), match(grid$c[i], col_vars)] <- grid$cell[i]
+  if (identical(row_vars, col_vars)) {
+    diag(out) <- ""
+    out <- out[, -ncol(out), drop = FALSE]
+  }
+  out
+}
+
+tendency_labels <- c(BetsPerSlip = "Bets per slip", MLWinProb = "Win probability of moneyline bets",
+  FavoriteShare = "Favorite share of team bets", OverShare = "Over share of totals bets",
+  ParlayRate = "Parlay rate (2+ bet slips)")
+
+tendencies <- bets %>%
+  group_by(PROLIFIC_PID) %>%
+  summarise(MLWinProb = mean(q[Took == 1 & BetType == "Moneyline"]),
+    FavoriteShare = mean(Favorite[Took == 1 & Favorite != 0] > 0),
+    OverShare = mean(Over[Took == 1 & Over != 0] > 0), .groups = "drop") %>%
+  left_join(blocks %>% group_by(PROLIFIC_PID) %>%
+    summarise(BetsPerSlip = mean(NumBets), ParlayRate = if (any(NumBets >= 2)) sum(Parlay) / sum(NumBets >= 2) else NA_real_, .groups = "drop"),
+    by = "PROLIFIC_PID") %>%
+  mutate(across(-PROLIFIC_PID, ~ if_else(is.nan(.x), NA_real_, .x))) %>%
+  left_join(persons_raw %>% mutate(across(c(Frequency, Typical.Bet, Recency, NumPlatforms), log1p)), by = "PROLIFIC_PID")
+
+```
+
+# Method
+
+## Measures
+
+Internal consistency of the multi-item measures in the analysis sample (Cronbach's α; KR-20 for items scored correct or incorrect and for the sports-engagement indicators).
+
+```{r reliability}
+alpha_fn <- function(x) {
+  x <- x[complete.cases(x), , drop = FALSE]
+  ncol(x) / (ncol(x) - 1) * (1 - sum(apply(x, 2, var)) / var(rowSums(x)))
+}
+
+sub <- strat %>% filter(PROLIFIC_PID %in% persons$PROLIFIC_PID)
+
+rel <- c(DOSPERT = alpha_fn(select(sub, matches("^DOSPERT_\\d_num$"))),
+  ABIS = alpha_fn(select(sub, matches("^BIS_\\d_num$"))),
+  CRT = alpha_fn(select(sub, matches("^CRT\\d_bin$"))),
+  BNT = alpha_fn(select(sub, matches("^BNT\\d_bin$"))),
+  `Sports engagement` = alpha_fn(select(sub, matches("^SportsWatching_\\d+_num$")) %>% mutate(across(everything(), ~ as.numeric(.x >= 1)))))
+```
+
+DOSPERT α = `r nz(fmt2(rel["DOSPERT"]))`; ABIS nonplanning α = `r nz(fmt2(rel["ABIS"]))`; CRT KR-20 = `r nz(fmt2(rel["CRT"]))`; BNT KR-20 = `r nz(fmt2(rel["BNT"]))`; sports engagement KR-20 = `r nz(fmt2(rel["Sports engagement"]))`.
+
+## Participants
+
+```{r duration}
+dur_an <- strat$Duration..in.seconds.[strat$PROLIFIC_PID %in% persons_raw$PROLIFIC_PID]
+fmt_mmss <- function(x) paste0(floor(x / 60), " min ", floor(x %% 60 + .5), " s")
+```
+
+The analysis sample is `r nrow(persons_raw)` participants. Median completion time was `r fmt_mmss(median(dur_an))` (IQR: `r fmt_mmss(quantile(dur_an, .25))` to `r fmt_mmss(quantile(dur_an, .75))`).
+
+```{r tab-1}
+demo_src <- strat %>% filter(PROLIFIC_PID %in% persons$PROLIFIC_PID)
+
+race_lvls <- c("White (Non-Hispanic)", "African American or Black", "White (Hispanic)")
+
+fin_lvls <- c("I am financially well-off", "I am financially comfortable", "I am somewhat financially comfortable",
+  "I have a little left over after basic needs", "I can just meet basic needs", "I struggle to meet basic needs", "I cannot meet basic needs")
+
+edu_lvls <- c("Doctorate or Professional degree (eg. PhD, MD, JD, DDS, EdD)", "Masters degree (ex. MA, MS, MBA)", "Bachelor's or 4 year degree (ex. BA, BS)",
+  "Associate degree (ex. AA, AS)", "Some college, no degree", "High school graduate or equivalent (ex. GED)", "Less than High School (no diploma)")
+
+n_pct_lvl <- function(x, lv) tibble(Level = lv, N = map_int(lv, ~ sum(x == .x, na.rm = TRUE)), Percentage = sprintf("%.1f%%", 100 * N / length(x)))
+
+race_other <- demo_src$Race.Ethnicity[!demo_src$Race.Ethnicity %in% race_lvls]
+
+tab_demo <- bind_rows(
+  n_pct_lvl(demo_src$Gender, c("Male", "Female")) %>% mutate(Variable = "Gender"),
+  n_pct_lvl(if_else(demo_src$Race.Ethnicity %in% race_lvls, demo_src$Race.Ethnicity, "Other"), c(race_lvls, "Other")) %>% mutate(Variable = "Race/Ethnicity"),
+  n_pct_lvl(str_squish(demo_src$Financial.Wellbeing.), fin_lvls) %>% mutate(Variable = "Subjective Financial Wellbeing"),
+  n_pct_lvl(demo_src$Education, edu_lvls) %>% mutate(Variable = "Education"),
+  tibble(Variable = "Age", Level = "Mean (SD)", N = NA_integer_, Percentage = m_sd(demo_src$Age))) %>%
+  select(Variable, Level, N, Percentage) %>%
+  mutate(N = as.character(N), N = replace_na(N, ""))
+
+stopifnot(all(tab_demo %>% filter(Variable != "Age") %>% group_by(Variable) %>% summarise(s = sum(as.integer(N))) %>% pull(s) == nrow(demo_src)))
+
+kable(tab_demo, caption = paste0("Table 1. Demographic information for the sample (N = ", nrow(demo_src), ")")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  footnote(general = paste0("Other race and ethnicity: ", paste(names(table(race_other)), " (n = ", table(race_other), ")", sep = "", collapse = ", "),
+    ". Gender, race (White non-Hispanic vs. other), and education (bachelor's degree or higher vs. less) enter the models as binary covariates."))
+```
+
+## Statistical Analyses
+
+The analysis sample has `r nrow(persons)` participants, `r format(nrow(bets), big.mark = ",")` bet decisions, and `r nrow(parlay_d)` slips with two or more bets. The models are listed in Table 2 of the manuscript. All models are fit here; their convergence diagnostics are in Appendix A (Table A1).
+
+```{r fit-bets, results='hide'}
+menu_terms <- "MarketType + WinProb10 + Favorite + Over + Shown + Shown:WinProb10"
+
+cov_terms <- paste(cov_names, collapse = " + ")
+
+int_terms <- paste0("(", cov_terms, "):(WinProb10 + Favorite + Over + Totals)")
+
+re_slip <- "(1 | Block)"
+
+re_bet <- "(1 | OptionID)"
+
+re_person <- "(1 + WinProb10 + Favorite + Over + Totals | PROLIFIC_PID)"
+
+bet_specs <- tribble(~Model, ~Formula,
+  "M1 Menu", paste("Took ~", menu_terms, "+", re_bet, "+", re_slip),
+  "M2 Covariates", paste("Took ~", cov_terms, "+", re_slip),
+  "M3 Menu + covariates", paste("Took ~", menu_terms, "+", cov_terms, "+", re_bet, "+", re_slip),
+  "M4 + interactions", paste("Took ~", menu_terms, "+", cov_terms, "+", int_terms, "+", re_bet, "+", re_slip),
+  "M5 Menu + preferences", paste("Took ~", menu_terms, "+", re_bet, "+", re_slip, "+", re_person),
+  "M6 Preferences + covariates", paste("Took ~", menu_terms, "+", cov_terms, "+", int_terms, "+", re_bet, "+", re_slip, "+", re_person)) %>%
+  mutate(File = paste0("bet_", str_extract(Model, "^M\\d")))
+
+bets <- bets %>% mutate(row = row_number())
+
+bet_fits <- par_run(nrow(bet_specs), function(i) fit_model(bet_specs$Formula[i], bets, bet_specs$File[i])) %>% setNames(bet_specs$Model)
+
+bet_cv <- par_run(nrow(bet_specs), function(i) cv_predict(bet_fits[[i]], bets, bet_specs$File[i], "Took") %>%
+  mutate(Model = bet_specs$Model[i])) %>% bind_rows()
+```
+
+```{r fit-parlays, results='hide'}
+slip_terms <- "Scenario + Legs + LegWinProb10 + Shown"
+
+parlay_specs <- tribble(~Model, ~Formula,
+  "P1 Menu", paste("Parlay ~", slip_terms),
+  "P2 Covariates", paste("Parlay ~", cov_terms),
+  "P3 Menu + covariates", paste("Parlay ~", slip_terms, "+", cov_terms),
+  "P4 Menu + preference", paste("Parlay ~", slip_terms, "+ (1 | PROLIFIC_PID)"),
+  "P5 Preference + covariates", paste("Parlay ~", slip_terms, "+", cov_terms, "+ (1 | PROLIFIC_PID)")) %>%
+  mutate(File = paste0("parlay_", str_extract(Model, "^P\\d")))
+
+parlay_d <- parlay_d %>% mutate(row = row_number())
+
+parlay_fits <- par_run(nrow(parlay_specs), function(i) fit_model(parlay_specs$Formula[i], parlay_d, parlay_specs$File[i])) %>% setNames(parlay_specs$Model)
+
+parlay_cv <- par_run(nrow(parlay_specs), function(i) cv_predict(parlay_fits[[i]], parlay_d, parlay_specs$File[i], "Parlay") %>%
+  mutate(Model = parlay_specs$Model[i])) %>% bind_rows()
+```
+
+```{r software}
+tibble(Software = c("R", "brms", "rstan", "Stan"),
+  Version = c(R.version$version.string, as.character(packageVersion("brms")), as.character(packageVersion("rstan")), rstan::stan_version())) %>%
+  kable(caption = "Software versions") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+# Results
+
+## Summary Statistics
+
+```{r tab-3}
+binary_vars <- c("Gender", "RaceBinary", "EducationBinary")
+
+demo_vars <- c("Age", "Gender", "RaceBinary", "EducationBinary", "FinancialNum")
+
+tab1_cov <- tibble(Variable = str_remove(cov_labels[cov_names], " \\(log\\)"), var = cov_names) %>%
+  filter(!var %in% demo_vars) %>%
+  mutate(n = nrow(persons_raw),
+    `M (SD) or n (%)` = map_chr(var, ~ if (.x %in% binary_vars) n_pct(persons_raw[[.x]]) else m_sd(persons_raw[[.x]])),
+    Range = map_chr(var, ~ if (.x %in% binary_vars) "" else rng(persons_raw[[.x]], if (.x %in% c("Age", "YearBegin", "Frequency", "Recency", "NumPlatforms", "Typical.Bet")) 0 else 2))) %>%
+  select(-var)
+
+n_shown <- sum(persons_raw$InformationCondition == "Shown")
+
+tab1_tend <- tibble(Variable = tendency_labels, var = names(tendency_labels)) %>%
+  mutate(n = map_int(var, ~ sum(!is.na(tendencies[[.x]]))), `M (SD) or n (%)` = map_chr(var, ~ m_sd(tendencies[[.x]])),
+    Range = map_chr(var, ~ rng(tendencies[[.x]]))) %>%
+  select(-var)
+
+tab1 <- bind_rows(tab1_cov, tab1_tend)
+
+med_iqr <- function(x, d = 1) paste0(formatC(median(x), format = "f", digits = d), " (", formatC(quantile(x, .25), format = "f", digits = d), " to ", formatC(quantile(x, .75), format = "f", digits = d), ")")
+
+med_iqr_txt <- paste0("Bets per week ", med_iqr(persons_raw$Frequency), "; typical bet $", med_iqr(persons_raw$Typical.Bet, 0),
+  "; days since last bet ", med_iqr(persons_raw$Recency, 0), "; platforms ", med_iqr(persons_raw$NumPlatforms, 0),
+  "; year began betting ", med_iqr(persons_raw$YearBegin, 0), ".")
+
+kable(tab1, caption = paste0("Table 3. Descriptive statistics for the nondemographic covariates and person-level betting tendencies (N = ", nrow(persons_raw), ")")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  pack_rows("Covariates", 1, nrow(tab1_cov)) %>%
+  pack_rows("Person-level betting tendencies (across the four slates)", nrow(tab1_cov) + 1, nrow(tab1)) %>%
+  footnote(general = c("Covariates are untransformed. Betting frequency, typical bet amount, days since last bet, and number of platforms were log(1 + x) transformed in the models and correlations.",
+    "The n for each tendency varies because a share is undefined for a participant who never took that kind of bet."))
+```
+
+Participants took `r pct(mean(bets$Took))` of the bets offered (`r fmt2(mean(blocks$NumBets))` bets per slip). `r sum(blocks$NumBets == 0)` of the `r format(nrow(blocks), big.mark = ",")` slips (`r pct(mean(blocks$NumBets == 0))`) contained no bet. `r n_shown` of the `r nrow(persons_raw)` participants (`r pct(n_shown / nrow(persons_raw))`) saw the probabilities.
+
+The mean DOSPERT score was `r fmt2(mean(persons_raw$DOSPERTMean))`. For comparison, Blais and Weber (2006, Table 2) report a summed score of 20.67 (*SD* = 8.51) over the six financial items for English-speaking North American adults, or `r fmt2(20.67 / 6)` (`r fmt2(8.51 / 6)`) per item. The mean ABIS nonplanning score was `r fmt2(mean(persons_raw$BISMean))`.
+
+Medians (interquartile ranges) of the betting-habit measures: `r med_iqr_txt`
+
+```{r wager-check}
+wager_check <- blocks %>%
+  filter(TotalStake > 0) %>%
+  mutate(Wagers = if_else(Parlay == 1, 1L, NumBets)) %>%
+  group_by(PROLIFIC_PID) %>%
+  summarise(MeanWager = sum(TotalStake) / sum(Wagers), .groups = "drop") %>%
+  inner_join(persons_raw %>% select(PROLIFIC_PID, Typical.Bet), by = "PROLIFIC_PID")
+
+ct_wager <- cor.test(log1p(wager_check$MeanWager), log1p(wager_check$Typical.Bet))
+
+sp_wager <- suppressWarnings(cor.test(wager_check$MeanWager, wager_check$Typical.Bet, method = "spearman"))
+```
+
+Among the `r nrow(wager_check)` participants who placed at least one wager, the mean amount wagered per bet in the task correlated with the reported typical bet amount at *r* = `r nz(fmt2(unname(ct_wager$estimate)))`, 95% CI [`r nz(fmt2(ct_wager$conf.int[1]))`, `r nz(fmt2(ct_wager$conf.int[2]))`] (both log(1 + *x*) transformed).
+
+```{r bet-odds}
+taken_odds <- bets %>%
+  filter(Took == 1) %>%
+  mutate(Side = case_when(Favorite > 0 ~ "Favorite", Favorite < 0 ~ "Underdog", Over > 0 ~ "Over", TRUE ~ "Under"))
+
+ml_taken <- taken_odds %>% filter(BetType == "Moneyline")
+
+ml_person <- ml_taken %>% group_by(PROLIFIC_PID) %>% summarise(FavShare = mean(Favorite > 0), .groups = "drop")
+
+team_range <- menu %>% filter(BetType != "Moneyline") %>% summarise(lo = min(q), hi = max(q))
+```
+
+Every spread and totals bet had a no-vig win probability between `r nz(fmt2(team_range$lo))` and `r nz(fmt2(team_range$hi))`. Moneyline favorites made up `r pct(mean(ml_taken$Favorite > 0))` of the moneyline bets taken (mean no-vig win probability = `r nz(fmt2(mean(ml_taken$q[ml_taken$Favorite > 0])))`), and underdogs `r pct(mean(ml_taken$Favorite < 0))` (mean = `r nz(fmt2(mean(ml_taken$q[ml_taken$Favorite < 0])))`). Of the `r nrow(ml_person)` participants who took a moneyline bet, `r sum(ml_person$FavShare == 1)` took only favorites, `r sum(ml_person$FavShare == 0)` took only underdogs, and `r sum(ml_person$FavShare > 0 & ml_person$FavShare < 1)` took both. The person-level means for favorites, overs, and parlaying are in Table 3.
+
+```{r tab-4}
+tab2 <- blocks %>%
+  group_by(Scenario) %>%
+  summarise(Slips = n(),
+    `No bet` = pct(mean(NumBets == 0)),
+    `Bets per slip, M (SD)` = m_sd(NumBets),
+    `Slips with 2+ bets` = sum(NumBets >= 2),
+    `Parlayed (of 2+ bet slips)` = pct(sum(Parlay) / sum(NumBets >= 2)),
+    `Median stake ($)` = formatC(median(TotalStake[NumBets > 0], na.rm = TRUE), format = "f", digits = 0),
+    .groups = "drop") %>%
+  rename(Slate = Scenario) %>%
+  mutate(Slate = cfp(as.character(Slate)))
+
+kable(tab2, caption = "Table 4. Betting behavior in each slate") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Median stake is the total amount wagered on the slip (the parlay stake for a parlayed slip), among slips with at least one bet. CFP = College Football Playoff.")
+```
+
+## Correlations
+
+```{r cor-cov}
+tab3 <- cor_table(tendencies, cov_names, row_labels = paste0(seq_along(cov_names), ". ", cov_labels[cov_names]), col_labels = as.character(seq_along(cov_names)))
+
+n_sig_b1 <- sum(str_detect(tab3, "\\*"))
+
+max_r_b1 <- max(abs(as.numeric(str_remove(str_replace(tab3[tab3 != ""], "^(-?)\\.", "\\10."), "\\*"))))
+```
+
+`r n_sig_b1` of the `r choose(length(cov_names), 2)` correlations among the covariates were significant after Holm correction, and the largest was |*r*| = `r nz(fmt2(max_r_b1))` (Table B1, Appendix B).
+
+```{r tab-5}
+tab4 <- cor_table(tendencies, cov_names, names(tendency_labels), row_labels = cov_labels[cov_names], col_labels = tendency_labels, by = "col")
+
+n_sig_tab4 <- sum(str_detect(tab4, "\\*"))
+
+sig_tab4 <- which(matrix(str_detect(tab4, "\\*"), nrow = nrow(tab4)), arr.ind = TRUE)
+
+sig_tab4_txt <- if (nrow(sig_tab4) == 0) "none" else paste0(rownames(tab4)[sig_tab4[, 1]], " with ", tolower(colnames(tab4)[sig_tab4[, 2]]), " (r = ", sub("^(-?)0\\.", "\\1.", str_remove(tab4[sig_tab4], "\\*")), ")", collapse = "; ")
+
+max_r_tab4 <- max(abs(as.numeric(str_remove(str_replace(tab4, "^(-?)\\.", "\\10."), "\\*"))), na.rm = TRUE)
+
+kable(tab4, caption = "Table 5. Correlations between covariates and person-level betting tendencies") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Pearson correlations, pairwise complete. * Holm-adjusted p < .05 within each column (17 correlations per betting tendency).")
+```
+
+`r n_sig_tab4` of the `r length(tab4)` correlations were significant after Holm correction within each column (`r sig_tab4_txt`).
+
+```{r tab-6}
+wide_bets <- blocks %>% select(PROLIFIC_PID, Scenario, NumBets) %>% pivot_wider(names_from = Scenario, values_from = NumBets)
+
+wide_parlay <- blocks %>%
+  mutate(ParlayEl = if_else(NumBets >= 2, Parlay, NA_integer_)) %>%
+  select(PROLIFIC_PID, Scenario, ParlayEl) %>%
+  pivot_wider(names_from = Scenario, values_from = ParlayEl)
+
+tab5a <- cor_table(wide_bets, scenario_levels, method = "spearman")
+
+tab5b <- cor_table(wide_parlay, scenario_levels)
+
+tab5 <- rbind(tab5a, tab5b)
+
+rownames(tab5) <- NULL
+
+tab5 <- cbind(Slate = cfp(rep(scenario_levels, 2)), tab5)
+
+colnames(tab5) <- cfp(colnames(tab5))
+
+kable(tab5, caption = "Table 6. Cross-slate consistency of the number of bets and the parlay decision") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  pack_rows("Number of bets (Spearman ρ)", 1, 4) %>%
+  pack_rows("Parlayed (φ, slips with 2+ bets in both slates)", 5, 8) %>%
+  footnote(general = "* Holm-adjusted p < .05 within each panel.")
+
+parlay_extremes <- blocks %>%
+  group_by(PROLIFIC_PID) %>%
+  summarise(Eligible = sum(NumBets >= 2), Parlayed = sum(Parlay), .groups = "drop") %>%
+  filter(Eligible >= 2)
+```
+
+## Predicting Which Bets Participants Took
+
+```{r tab-7}
+bet_metrics <- cv_metrics(bet_cv) %>%
+  mutate(Model = factor(Model, bet_specs$Model)) %>%
+  arrange(Model)
+
+bet_comparisons <- tribble(~Comparison, ~a, ~b,
+  "Covariates vs. menu (M3 vs. M1)", "M1 Menu", "M3 Menu + covariates",
+  "Interactions vs. main effects (M4 vs. M3)", "M3 Menu + covariates", "M4 + interactions",
+  "Preferences vs. menu (M5 vs. M1)", "M1 Menu", "M5 Menu + preferences",
+  "Preferences vs. best covariate model (M5 vs. M3)", "M3 Menu + covariates", "M5 Menu + preferences",
+  "Preferences vs. interaction model (M5 vs. M4)", "M4 + interactions", "M5 Menu + preferences",
+  "Covariates added to preferences (M6 vs. M5)", "M5 Menu + preferences", "M6 Preferences + covariates") %>%
+  mutate(v = map2(a, b, ~ elpd_diff(bet_cv, .x, .y)), d = map_dbl(v, "d"), se = map_dbl(v, "se"))
+
+bet_vs_best <- elpd_vs_best(bet_cv)
+
+bet_metrics <- bet_metrics %>% left_join(bet_vs_best %>% mutate(Model = factor(Model, bet_specs$Model)), by = "Model")
+
+best_bet <- as.character(bet_metrics$Model[bet_metrics$Best])
+
+r2_bet <- setNames(bet_metrics$`CV pseudo-R²`, as.character(bet_metrics$Model))
+
+auc_bet <- setNames(bet_metrics$AUC, as.character(bet_metrics$Model))
+
+cmp_bet <- bet_comparisons %>% select(Comparison, d, se)
+
+# Gains measured from the same baseline (M1): preferences added to the menu vs. covariates added to the menu
+gain_ratio <- cmp_bet$d[str_detect(cmp_bet$Comparison, "M5 vs. M1")] / cmp_bet$d[str_detect(cmp_bet$Comparison, "M3 vs. M1")]
+
+bet_metrics %>%
+  transmute(Model = str_extract(Model, "^M\\d"),
+    `ΔELPD from best (SE)` = if_else(Best, "0.0 (best)", paste0(formatC(d_best, format = "f", digits = 1), " (", formatC(se_best, format = "f", digits = 1), ")")),
+    `Pseudo-R²` = r2z(`CV pseudo-R²`), AUC = r2z(AUC)) %>%
+  kable(caption = "Table 7. Out-of-sample prediction of which bets were taken") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Each participant's held-out slate was predicted from a model fit to that participant's other three slates and to all other participants' data. ΔELPD = difference in summed held-out log predictive density from the best model; SE computed over held-out slips. Pseudo-R² = 1 − (held-out log likelihood of the model / held-out log likelihood of a base-rate model). AUC = area under the receiver operating characteristic curve.")
+
+bet_comparisons %>%
+  transmute(Comparison, `ΔELPD (SE)` = paste0(formatC(d, format = "f", digits = 1), " (", formatC(se, format = "f", digits = 1), ")")) %>%
+  kable(caption = "Model comparisons reported in the text (Analysis 1)") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Positive = the second model predicts held-out choices better. Differences larger than about 2 SE are reliable.")
+```
+
+Bet characteristics alone (M1): pseudo-*R*² = `r r2z(r2_bet["M1 Menu"])`, AUC = `r r2z(auc_bet["M1 Menu"])`. Covariates alone (M2): pseudo-*R*² = `r r2z(r2_bet["M2 Covariates"])`, AUC = `r r2z(auc_bet["M2 Covariates"])`. M3 vs. M1: `r d_txt(cmp_bet, "M3 vs. M1")`. M4 vs. M3: `r d_txt(cmp_bet, "M4 vs. M3")`. M5 vs. M1: `r d_txt(cmp_bet, "M5 vs. M1")`, `r formatC(gain_ratio, format = "f", digits = 1)` times the gain from the covariates (M3 vs. M1). M5 vs. M3: `r d_txt(cmp_bet, "M5 vs. M3")`; M5 pseudo-*R*² = `r r2z(r2_bet["M5 Menu + preferences"])`, AUC = `r r2z(auc_bet["M5 Menu + preferences"])`. M6 vs. M5: `r d_txt(cmp_bet, "M6 vs. M5")`.
+
+```{r m5-values}
+m5 <- bet_fits[["M5 Menu + preferences"]]
+
+menu_pars <- c("WinProb10", "Favorite", "Over", "Shown", "WinProb10:Shown")
+
+menu_labels <- c(WinProb10 = "Win probability (+10 points)", Favorite = "Favorite vs. underdog", Over = "Over vs. under",
+  Shown = "Probabilities shown", `WinProb10:Shown` = "Win probability × probabilities shown")
+
+mt <- function(lbl) paste0("MarketType", which(levels(bets$MarketType) == lbl))
+
+p_int_m5 <- plogis(fixef(m5)["Intercept", "Estimate"])
+
+pref_pars <- c(Intercept = "Overall appetite (more bets)", WinProb10 = "Taste for likely winners", Favorite = "Taste for favorites",
+  Over = "Taste for overs", Totals = "Taste for totals bets")
+
+cor_m5 <- VarCorr(m5)$PROLIFIC_PID$cor
+
+r_app_win <- cor_m5["Intercept", "Estimate", "WinProb10"]
+
+r_other_max <- max(abs(c(cor_m5["WinProb10", "Estimate", "Favorite"], cor_m5["Intercept", "Estimate", "Favorite"],
+  cor_m5["Intercept", "Estimate", "Over"], cor_m5["WinProb10", "Estimate", "Over"], cor_m5["Favorite", "Estimate", "Over"])))
+
+# Share of each preference's between-person variance explained by the covariates (M6 vs. M5)
+tab10 <- tibble(par = names(pref_pars), Preference = pref_pars) %>%
+  mutate(sd_m5 = map(par, ~ VarCorr(m5)$PROLIFIC_PID$sd[.x, ]),
+    `Between-person SD (M5) [95% CrI]` = map_chr(sd_m5, ~ paste0(fmt2(.x["Estimate"]), " [", fmt2(.x["Q2.5"]), ", ", fmt2(.x["Q97.5"]), "]")),
+    r2 = map(par, ~ r2_between(m5, bet_fits[["M6 Preferences + covariates"]], paste0("sd_PROLIFIC_PID__", .x))),
+    `Explained by covariates [95% CrI]` = map_chr(r2, pct_ci))
+
+r2b <- function(p) tab10$r2[[which(tab10$par == p)]]
+
+
+# Favorite-vs-underdog (and over-vs-under) odds ratio for a participant 1 SD above and below the average preference.
+# Favorite and Over are coded ±0.5, so exp(b + u) is that participant's odds ratio for one side over the other.
+side_or <- function(fit, par) {
+  b <- fixef(fit)[par, "Estimate"]; s <- VarCorr(fit)$PROLIFIC_PID$sd[par, "Estimate"]
+  c(avg = exp(b), above = exp(b + s), below = exp(b - s), ratio = exp(s))
+}
+
+fav_sd <- side_or(m5, "Favorite")
+```
+
+Values reported for M5 (Table 8): intercept `r or_txt(m5, "Intercept")` (about a `r round(100 * p_int_m5)`% chance); NFL spread `r or_txt(m5, mt("NFL Spread"))`; NFL moneyline `r or_txt(m5, mt("NFL Moneyline"))`; CFP totals `r or_txt(m5, mt("CFB Totals"))`; bet intercept `r sd_txt(m5, "OptionID", "Intercept")`; win probability `r or_txt(m5, "WinProb10")`; favorite `r or_txt(m5, "Favorite")`; over `r or_txt(m5, "Over")`; probabilities shown `r or_txt(m5, "Shown")`; win probability × probabilities shown `r or_txt(m5, "WinProb10:Shown")`. The same interaction in M1: `r or_txt(bet_fits[["M1 Menu"]], "WinProb10:Shown")` (Table B2).
+
+Between-participant SDs: overs `r sd_txt(m5, "PROLIFIC_PID", "Over")`; favorites `r sd_txt(m5, "PROLIFIC_PID", "Favorite")`; appetite `r sd_txt(m5, "PROLIFIC_PID", "Intercept")`; likely winners `r sd_txt(m5, "PROLIFIC_PID", "WinProb10")`; totals `r sd_txt(m5, "PROLIFIC_PID", "Totals")`. A participant 1 SD above the average favorite preference had about `r formatC(fav_sd["above"], format = "f", digits = 1)` times the odds of taking the favorite rather than the underdog; 1 SD below average, OR = `r fmt2(fav_sd["below"])`. Correlations among the four main preferences: |*r*| ≤ `r nz(fmt2(r_other_max))`, except appetite with likely winners (*r* = `r nz(fmt2(r_app_win))`). Slip SD = `r fmt2(VarCorr(m5)$Block$sd["Intercept", "Estimate"])`. Variance explained by the covariates (M6 vs. M5): appetite `r r2_med(r2b("Intercept"))` (95% CrI `r r2_ci(r2b("Intercept"))`), likely winners `r r2_med(r2b("WinProb10"))` (`r r2_ci(r2b("WinProb10"))`), favorites `r r2_med(r2b("Favorite"))` (`r r2_ci(r2b("Favorite"))`), overs `r r2_med(r2b("Over"))` (`r r2_ci(r2b("Over"))`).
+
+```{r tab-8}
+coef_table(m5, "Table 8. Full results for M5 (characteristics + stable preferences): taking a bet")
+```
+
+```{r m6-effects}
+cov_m6 <- or_ci(bet_fits[["M6 Preferences + covariates"]], cov_names)
+
+int_names <- rownames(fixef(bet_fits[["M6 Preferences + covariates"]])) %>% str_subset(":") %>% str_subset("Shown", negate = TRUE)
+
+int_m6 <- or_ci(bet_fits[["M6 Preferences + covariates"]], int_names)
+```
+
+Covariate main effects in M6 with 95% credible intervals excluding 1: `r paste0(str_to_lower(cov_labels[cov_m6$term[cov_m6$credible]]), " (OR = ", cov_m6$"OR [95% CrI]"[cov_m6$credible], ")", collapse = "; ")`. `r sum(int_m6$credible)` of the `r nrow(int_m6)` covariate × bet-characteristic interactions had intervals excluding zero (`r .05 * nrow(int_m6)` expected by chance): `r paste0(term_label(int_m6$term[int_m6$credible]), " (OR = ", int_m6$"OR [95% CrI]"[int_m6$credible], ")", collapse = "; ")`.
+
+## Predicting Whether Participants Parlayed
+
+```{r tab-9}
+parlay_metrics <- cv_metrics(parlay_cv) %>%
+  mutate(Model = factor(Model, parlay_specs$Model)) %>%
+  arrange(Model)
+
+parlay_comparisons <- tribble(~Comparison, ~a, ~b,
+  "Covariates vs. menu (P3 vs. P1)", "P1 Menu", "P3 Menu + covariates",
+  "Preference vs. menu (P4 vs. P1)", "P1 Menu", "P4 Menu + preference",
+  "Preference vs. covariates (P4 vs. P3)", "P3 Menu + covariates", "P4 Menu + preference",
+  "Covariates added to preference (P5 vs. P4)", "P4 Menu + preference", "P5 Preference + covariates") %>%
+  mutate(v = map2(a, b, ~ elpd_diff(parlay_cv, .x, .y)), d = map_dbl(v, "d"), se = map_dbl(v, "se"))
+
+parlay_vs_best <- elpd_vs_best(parlay_cv)
+
+parlay_metrics <- parlay_metrics %>% left_join(parlay_vs_best %>% mutate(Model = factor(Model, parlay_specs$Model)), by = "Model")
+
+best_parlay <- as.character(parlay_metrics$Model[parlay_metrics$Best])
+
+parlay_metrics %>%
+  transmute(Model = str_extract(Model, "^P\\d"),
+    `ΔELPD from best (SE)` = if_else(Best, "0.0 (best)", paste0(formatC(d_best, format = "f", digits = 1), " (", formatC(se_best, format = "f", digits = 1), ")")),
+    `Pseudo-R²` = r2z(`CV pseudo-R²`), AUC = r2z(AUC)) %>%
+  kable(caption = "Table 9. Out-of-sample prediction of whether participants parlayed") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Each participant's held-out slip was predicted from a model fit to that participant's other slips and to all other participants' data. ΔELPD = difference in summed held-out log predictive density from the best model; SE computed over held-out slips. Pseudo-R² = 1 − (held-out log likelihood of the model / held-out log likelihood of a base-rate model). AUC = area under the receiver operating characteristic curve. A participant whose only slip with two or more bets is held out has no training data, so the preference models fall back on the population average for that slip.")
+
+parlay_comparisons %>%
+  transmute(Comparison, `ΔELPD (SE)` = paste0(formatC(d, format = "f", digits = 1), " (", formatC(se, format = "f", digits = 1), ")")) %>%
+  kable(caption = "Model comparisons reported in the text (Analysis 2)") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Positive = the second model predicts held-out choices better. Differences larger than about 2 SE are reliable.")
+
+tau_p4 <- as_draws_df(parlay_fits[["P4 Menu + preference"]])$sd_PROLIFIC_PID__Intercept
+
+tau_p4_ci <- c(mean(tau_p4), quantile(tau_p4, c(.025, .975)))  # posterior mean, as in Table 10
+
+icc_parlay <- quantile(tau_p4^2 / (tau_p4^2 + pi^2 / 3), c(.5, .025, .975))
+
+r2b_parlay <- r2_between(parlay_fits[["P4 Menu + preference"]], parlay_fits[["P5 Preference + covariates"]], "sd_PROLIFIC_PID__Intercept")
+
+r2_parlay <- setNames(parlay_metrics$`CV pseudo-R²`, as.character(parlay_metrics$Model))
+
+auc_parlay <- setNames(parlay_metrics$AUC, as.character(parlay_metrics$Model))
+
+cmp_parlay <- parlay_comparisons %>% select(Comparison, d, se)
+
+# Gains measured from the same baseline (P1), as in Analysis 1
+parlay_ratio <- cmp_parlay$d[str_detect(cmp_parlay$Comparison, "P4 vs. P1")] / cmp_parlay$d[str_detect(cmp_parlay$Comparison, "P3 vs. P1")]
+```
+
+P1: pseudo-*R*² = `r r2z(r2_parlay["P1 Menu"])`, AUC = `r r2z(auc_parlay["P1 Menu"])`. P2: pseudo-*R*² = `r r2z(r2_parlay["P2 Covariates"])`, AUC = `r r2z(auc_parlay["P2 Covariates"])`. P3 vs. P1: `r d_txt(cmp_parlay, "P3 vs. P1")`; P3 pseudo-*R*² = `r r2z(r2_parlay["P3 Menu + covariates"])`, AUC = `r r2z(auc_parlay["P3 Menu + covariates"])`. P4 vs. P1: `r d_txt(cmp_parlay, "P4 vs. P1")`, `r formatC(parlay_ratio, format = "f", digits = 1)` times the gain from the covariates (P3 vs. P1). P4 vs. P3: `r d_txt(cmp_parlay, "P4 vs. P3")`; P4 pseudo-*R*² = `r r2z(r2_parlay["P4 Menu + preference"])`, AUC = `r r2z(auc_parlay["P4 Menu + preference"])`. P5 vs. P4: `r d_txt(cmp_parlay, "P5 vs. P4")`.
+
+```{r p4-values}
+p4 <- parlay_fits[["P4 Menu + preference"]]
+
+p_int_p4 <- plogis(fixef(p4)["Intercept", "Estimate"])
+
+slate_or <- exp(fixef(p4)[paste0("Scenario", 1:3), "Estimate"])
+
+person_parlay <- tendencies$ParlayRate[!is.na(tendencies$ParlayRate)]
+```
+
+Values reported for P4 (Table 10): intercept `r or_txt(p4, "Intercept")` (about a `r round(100 * p_int_p4)`% chance); average leg win probability `r or_txt(p4, "LegWinProb10")`; legs `r or_txt(p4, "Legs")`; probabilities shown `r or_txt(p4, "Shown")`; slate ORs from `r fmt2(min(slate_or))` to `r fmt2(max(slate_or))`. Between-participant SD = `r fmt2(tau_p4_ci[1])` (95% CrI [`r fmt2(tau_p4_ci[2])`, `r fmt2(tau_p4_ci[3])`]), so a participant 1 SD above average had about `r round(exp(tau_p4_ci[1]))` times the odds of parlaying. Latent-scale ICC = `r nz(fmt2(icc_parlay[1]))` (95% CrI [`r nz(fmt2(icc_parlay[2]))`, `r nz(fmt2(icc_parlay[3]))`]). Of the `r nrow(parlay_extremes)` participants with at least two eligible slips, `r sum(parlay_extremes$Parlayed == 0)` never parlayed and `r sum(parlay_extremes$Parlayed == parlay_extremes$Eligible)` parlayed every eligible slip (`r pct(mean(parlay_extremes$Parlayed == 0 | parlay_extremes$Parlayed == parlay_extremes$Eligible))`). Person-level parlay rate *M* = `r fmt2(mean(person_parlay))`, *SD* = `r fmt2(sd(person_parlay))`. Variance explained by the covariates (P5 vs. P4): *R*²~between~ = `r r2_med(r2b_parlay)`, 95% CrI `r r2_ci(r2b_parlay)`.
+
+```{r tab-10}
+coef_table(p4, "Table 10. Full results for P4 (slip characteristics + stable parlay tendency): parlaying")
+```
+
+```{r p5-effects}
+cp5 <- or_ci(parlay_fits[["P5 Preference + covariates"]], cov_names)
+```
+
+Covariates in P5 with 95% credible intervals excluding 1: `r paste0(str_to_lower(cov_labels[cp5$term[cp5$credible]]), " (OR = ", cp5$"OR [95% CrI]"[cp5$credible], ")", collapse = "; ")`.
+
+## Relationship Between Single-Bet Preference and Parlaying
+
+The joint model refits M5 and P4 together and estimates the correlations between their participant effects. All `r n_distinct(persons$PROLIFIC_PID)` participants are included; the `r n_distinct(persons$PROLIFIC_PID) - n_distinct(parlay_d$PROLIFIC_PID)` who never took two or more bets in a slate contribute only to the bet-level part.
+
+```{r joint-fit, results='hide'}
+# Combined data: bet rows feed the Took response, slip rows feed the Parlay response (brms subset())
+joint_d <- bind_rows(
+  bets %>% transmute(PROLIFIC_PID, Block, OptionID = as.character(OptionID), MarketType = as.character(MarketType), WinProb10, Favorite, Over, Totals, Shown, Took, is_bet = TRUE),
+  parlay_d %>% transmute(PROLIFIC_PID, Block, Scenario = as.character(Scenario), Legs, LegWinProb10, Shown, Parlay, is_parlay = TRUE)) %>%
+  mutate(across(c(is_bet, is_parlay), ~ coalesce(.x, FALSE)),
+    OptionID = coalesce(OptionID, first(na.omit(OptionID))), MarketType = coalesce(MarketType, levels(bets$MarketType)[1]),
+    Scenario = coalesce(Scenario, scenario_levels[1]),
+    across(c(WinProb10, Favorite, Over, Totals, Shown, Took, Legs, LegWinProb10, Parlay), ~ coalesce(.x, 0)),
+    MarketType = factor(MarketType, levels(bets$MarketType)), Scenario = factor(Scenario, scenario_levels))
+
+contrasts(joint_d$MarketType) <- contr.sum(6)
+
+contrasts(joint_d$Scenario) <- contr.sum(4)
+
+# The (1 | p | PROLIFIC_PID) terms share the label p, so the participant effects of both responses are drawn jointly
+# and their correlations are estimated. Each response is fit only to its own rows (subset()).
+joint_formula <- bf(as.formula(paste("Took | subset(is_bet) ~", menu_terms, "+ (1 | OptionID) + (1 | Block) + (1 + WinProb10 + Favorite + Over + Totals | p | PROLIFIC_PID)")), family = bernoulli()) +
+  bf(as.formula(paste("Parlay | subset(is_parlay) ~", slip_terms, "+ (1 | p | PROLIFIC_PID)")), family = bernoulli()) +
+  set_rescor(FALSE)
+
+joint_fit <- brm(joint_formula, data = joint_d,
+  prior = prior(normal(0, 1), class = b, resp = "Took") + prior(normal(0, 1), class = b, resp = "Parlay") +
+    prior(exponential(1), class = sd, resp = "Took") + prior(exponential(1), class = sd, resp = "Parlay") + prior(lkj(2), class = cor),
+  chains = n_chains, iter = 6 * n_iter, control = list(adapt_delta = .99, max_treedepth = 12), seed = 1, refresh = 0, init = 0,
+  file = paste0(modelPath, "joint_M5_P4_6long"), file_refit = "on_change")  # six times the iterations of the other fits (24,000), with adapt_delta = .99 and max_treedepth = 12
+```
+
+```{r joint-results}
+# Latent correlations between each M5 preference and the P4 parlay tendency, from the joint model
+jd <- as_draws_df(joint_fit)
+
+joint_cor <- function(term) {
+  cands <- c(paste0("cor_PROLIFIC_PID__Took_", term, "__Parlay_Intercept"), paste0("cor_PROLIFIC_PID__Parlay_Intercept__Took_", term))
+  col <- intersect(cands, names(jd))
+  stopifnot(length(col) == 1)
+  jd[[col]]
+}
+
+m5_fit <- bet_fits[["M5 Menu + preferences"]]
+
+p4_fit <- parlay_fits[["P4 Menu + preference"]]
+
+# Check: correlation of the participant deviations from the separate M5 and P4 fits, draw by draw
+re_draws <- function(fit, term) {
+  dr <- subset_draws(as_draws_matrix(fit), variable = paste0("^r_PROLIFIC_PID\\[.*,", term, "\\]$"), regex = TRUE)
+  out <- matrix(as.numeric(dr), nrow = nrow(dr))
+  colnames(out) <- sub("^r_PROLIFIC_PID\\[(.*),.*\\]$", "\\1", colnames(dr))
+  out
+}
+
+p4_int <- re_draws(p4_fit, "Intercept")
+
+link_ids <- colnames(p4_int)
+
+link_res <- imap_dfr(pref_pars, function(lab, term) {
+  jr <- joint_cor(term)
+  a <- re_draws(m5_fit, term)[, link_ids, drop = FALSE]
+  n <- min(nrow(a), nrow(p4_int))
+  sep_r <- vapply(seq_len(n), function(i) cor(a[i, ], p4_int[i, ]), numeric(1))
+  tibble(term = term, Preference = lab, r = median(jr), lo = unname(quantile(jr, .025)), hi = unname(quantile(jr, .975)), pd = mean(jr > 0),
+    sr = median(sep_r), sr_lo = unname(quantile(sep_r, .025)), sr_hi = unname(quantile(sep_r, .975)))
+}) %>%
+  mutate(credible = lo > 0 | hi < 0)
+
+ci_str <- function(r, lo, hi) paste0(nz(fmt2(r)), " [", nz(fmt2(lo)), ", ", nz(fmt2(hi)), "]")
+
+link_res %>%
+  transmute(Preference, `Joint model: r [95% CrI]` = ci_str(r, lo, hi), `Probability r > 0` = nz(fmt2(pd)),
+    `Separate fits: r [95% CrI]` = ci_str(sr, sr_lo, sr_hi)) %>%
+  kable(caption = "Correlations between the M5 stable preferences and the P4 parlay tendency (reported in the text)") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  footnote(general = "Joint model: posterior median of the latent correlation between participants' random effects, with 95% credible interval; Probability r > 0 = share of posterior draws above zero. Separate fits: median across draws of the correlation between the participants' M5 and P4 deviations from the separately fitted models. Exploratory; no correction for multiple comparisons.")
+
+excluded_ids <- setdiff(persons$PROLIFIC_PID, link_ids)
+
+app_all <- ranef(m5_fit)$PROLIFIC_PID[, "Estimate", "Intercept"]
+```
+
+Participants with parlay data had a mean M5 appetite deviation of `r fmt2(mean(app_all[names(app_all) %in% link_ids]))`, compared with `r fmt2(mean(app_all[names(app_all) %in% excluded_ids]))` for those without. The largest squared correlation was *R*² = `r nz(fmt2(max(link_res$r)^2))`.
+
+# Appendix A: Convergence Diagnostics
+
+```{r tab-a1}
+diag_tbl <- function(fits) {
+  imap_dfr(fits, function(fit, nm) {
+    s <- summary(fit)
+    rh <- c(s$fixed$Rhat, unlist(map(s$random, "Rhat")))
+    ess <- c(s$fixed$Bulk_ESS, unlist(map(s$random, "Bulk_ESS")))
+    tibble(Model = nm, `Max R-hat` = fmt3(max(rh, na.rm = TRUE)), `Min bulk ESS` = round(min(ess, na.rm = TRUE)),
+      `Divergent transitions` = sum(nuts_params(fit) %>% filter(Parameter == "divergent__") %>% pull(Value)))
+  })
+}
+
+bind_rows(diag_tbl(bet_fits), diag_tbl(parlay_fits), diag_tbl(list(`Joint M5 + P4` = joint_fit))) %>%
+  kable(caption = "Table A1. Convergence diagnostics for the full-data models") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  pack_rows("Analysis 1: Taking a bet", 1, nrow(bet_specs)) %>%
+  pack_rows("Analysis 2: Parlaying", nrow(bet_specs) + 1, nrow(bet_specs) + nrow(parlay_specs)) %>%
+  pack_rows("Exploratory analysis: Single-bet preferences and parlaying", nrow(bet_specs) + nrow(parlay_specs) + 1, nrow(bet_specs) + nrow(parlay_specs) + 1) %>%
+  footnote(general = "ESS = effective sample size. The 11 main models used four chains of 4,000 iterations (2,000 warmup); the joint model used four chains of 24,000 iterations (12,000 warmup).")
+```
+
+# Appendix B: Tables
+
+```{r tab-b1}
+tab3 <- cbind(`M (SD)` = map_chr(cov_names, ~ m_sd(tendencies[[.x]])), tab3)
+
+kable(tab3, caption = "Table B1. Correlations among the covariates") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, font_size = 11) %>%
+  footnote(general = "Pearson correlations (N = 297). Betting frequency, typical bet amount, days since last bet, and number of platforms are log(1 + x) transformed. * Holm-adjusted p < .05 across all correlations in the table.")
+```
+
+```{r tab-b2}
+coef_table(bet_fits[["M1 Menu"]], "Table B2. Full results for M1 (characteristics only): taking a bet")
+```
+
+```{r tab-b3}
+coef_table(bet_fits[["M2 Covariates"]], "Table B3. Full results for M2 (covariates only): taking a bet")
+```
+
+```{r tab-b4}
+coef_table(bet_fits[["M3 Menu + covariates"]], "Table B4. Full results for M3 (characteristics + covariates): taking a bet")
+```
+
+```{r tab-b5}
+coef_table(bet_fits[["M4 + interactions"]], "Table B5. Full results for M4 (characteristics + covariates + covariate × characteristics interactions): taking a bet")
+```
+
+```{r tab-b6}
+coef_table(bet_fits[["M6 Preferences + covariates"]], "Table B6. Full results for M6 (characteristics + stable preferences + covariates): taking a bet")
+```
+
+```{r tab-b7}
+coef_table(parlay_fits[["P1 Menu"]], "Table B7. Full results for P1 (slip characteristics only): parlaying")
+```
+
+```{r tab-b8}
+coef_table(parlay_fits[["P2 Covariates"]], "Table B8. Full results for P2 (covariates only): parlaying")
+```
+
+```{r tab-b9}
+coef_table(parlay_fits[["P3 Menu + covariates"]], "Table B9. Full results for P3 (slip characteristics + covariates): parlaying")
+```
+
+```{r tab-b10}
+coef_table(parlay_fits[["P5 Preference + covariates"]], "Table B10. Full results for P5 (slip characteristics + stable parlay tendency + covariates): parlaying")
+```
